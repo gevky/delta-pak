@@ -1,0 +1,27 @@
+#!/bin/sh
+# Stub: records arguments and returns the next scripted menu selection.
+echo "minui-list $*" | tr '\n' ' ' >>"$STUB_LOG"
+echo "" >>"$STUB_LOG"
+out=""; file=""; title=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--write-location" ] && out="$a"
+  [ "$prev" = "--file" ] && file="$a"
+  [ "$prev" = "--title" ] && title="$a"
+  prev="$a"
+done
+# The rows themselves are what the user actually reads, so record them: a
+# label that is too long to fit is a bug this harness should be able to see.
+if [ -n "$file" ] && [ -f "$file" ]; then
+  while IFS= read -r row; do
+    echo "LIST_ROW [$title] $row" >>"$STUB_LOG"
+  done <"$file"
+fi
+sel="$(head -n 1 "$STUB_CHOICES" 2>/dev/null)"
+# BSD sed requires a backup suffix for -i while BusyBox/GNU sed do not. A
+# portable tail-and-rename keeps this harness from returning the first choice
+# forever on macOS.
+tail -n +2 "$STUB_CHOICES" >"$STUB_CHOICES.next" 2>/dev/null \
+  && mv -f "$STUB_CHOICES.next" "$STUB_CHOICES"
+[ -z "$sel" ] && exit 2                 # nothing scripted -> user cancelled
+[ -n "$out" ] && printf '%s' "$sel" >"$out"
+exit 0

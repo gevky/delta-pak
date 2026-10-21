@@ -1,0 +1,9 @@
+#!/bin/sh
+echo "minui-keyboard $*" >>"$STUB_LOG"
+out=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "--write-location" ] && out="$a"
+  prev="$a"
+done
+[ -n "$out" ] && printf '%s' "${STUB_TYPED_CODE:-TESTCODE}" >"$out"
+exit 0

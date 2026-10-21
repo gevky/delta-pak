@@ -1,0 +1,92 @@
+#!/bin/sh
+# Background sync service for the Delta Sync Pak.
+#
+# Registered in auto.sh when the user turns Auto Sync on. It covers the three
+# automatic sync points:
+#
+#   * at boot, once the network is up
+#   * after a game exits, so fresh progress reaches the cloud promptly
+#   * every POLL_MINUTES, to notice changes made on the phone
+#
+# Current NextUI releases provide a post-launch hook, which is the authoritative
+# game-exit signal. Process watching remains only as a fallback for older
+# releases; running both would sometimes start two complete Dropbox scans.
+
+PAK_NAME="Delta Sync"
+: "${SDCARD_PATH:=/mnt/SDCARD}"
+if [ "$PLATFORM" = "tg3040" ]; then PLATFORM=tg5040; fi
+: "${PLATFORM:=tg5040}"
+: "${SHARED_USERDATA_PATH:=$SDCARD_PATH/.userdata/shared}"
+: "${LOGS_PATH:=$SDCARD_PATH/.userdata/$PLATFORM/logs}"
+
+HOME="$SHARED_USERDATA_PATH/$PAK_NAME"
+export HOME
+mkdir -p "$HOME" "$LOGS_PATH"
+
+LOG="$LOGS_PATH/$PAK_NAME-service.txt"
+POLL_MINUTES="$(cat "$HOME/poll_minutes" 2>/dev/null || echo 30)"
+
+PAK_DIR="$SDCARD_PATH/Tools/$PLATFORM/$PAK_NAME.pak"
+WORKER="$PAK_DIR/bin/shared/sync-worker"
+HOOK_SH="$SDCARD_PATH/.userdata/$PLATFORM/.hooks/post-launch.d/delta-sync.sync.sh"
+[ -x "$WORKER" ] || exit 127
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"
+}
+
+run_sync() {
+    "$WORKER" "$1" >/dev/null 2>&1 || true
+}
+
+# A sync at boot is pointless until DNS and routing are up.
+wait_for_network() {
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if ping -c 1 -W 2 api.dropboxapi.com >/dev/null 2>&1; then
+            return 0
+        fi
+        i=$((i + 1))
+        sleep 4
+    done
+    log "network did not come up; syncing anyway"
+    return 1
+}
+
+game_running() {
+    # minarch is the NextUI/MinUI emulator host process.
+    pgrep -f minarch >/dev/null 2>&1
+}
+
+log "service starting (poll every ${POLL_MINUTES}m)"
+wait_for_network
+run_sync boot
+
+elapsed=0
+was_running=0
+
+while :; do
+    sleep 10
+    elapsed=$((elapsed + 10))
+
+    if [ ! -x "$HOOK_SH" ]; then
+        if game_running; then
+            was_running=1
+        elif [ "$was_running" -eq 1 ]; then
+            # Compatibility fallback for NextUI versions without hooks.
+            was_running=0
+            sleep 3
+            run_sync after-game
+            elapsed=0
+        fi
+    fi
+
+    if [ "$elapsed" -ge $((POLL_MINUTES * 60)) ]; then
+        elapsed=0
+        # Never sync underneath a running game: the emulator holds the save
+        # file open and writes it on exit, so anything we wrote would be lost.
+        if ! game_running; then
+            run_sync periodic
+        fi
+    fi
+done

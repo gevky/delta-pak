@@ -1,0 +1,212 @@
+#!/bin/sh
+# One sync entry point for the menu, boot service and NextUI launch hook.
+# The lock records its owner, so a lock left by a shutdown can be recovered
+# without allowing two live syncs to write the same save at once.
+
+PAK_NAME="Delta Sync"
+: "${SDCARD_PATH:=/mnt/SDCARD}"
+if [ "$PLATFORM" = "tg3040" ]; then PLATFORM=tg5040; fi
+: "${PLATFORM:=tg5040}"
+: "${SHARED_USERDATA_PATH:=$SDCARD_PATH/.userdata/shared}"
+: "${LOGS_PATH:=$SDCARD_PATH/.userdata/$PLATFORM/logs}"
+
+HOME="$SHARED_USERDATA_PATH/$PAK_NAME"
+export HOME
+mkdir -p "$HOME" "$LOGS_PATH"
+
+PAK_DIR="$SDCARD_PATH/Tools/$PLATFORM/$PAK_NAME.pak"
+export LD_LIBRARY_PATH="$PAK_DIR/lib:$LD_LIBRARY_PATH"
+architecture=arm
+uname -m | grep -q '64' && architecture=arm64
+DELTASYNC="$PAK_DIR/bin/$architecture/deltasync"
+[ -x "$DELTASYNC" ] || exit 127
+PRESENTER="$PAK_DIR/bin/$PLATFORM/minui-presenter"
+
+reason="${1:-automatic}"
+rom_path="${2:-}"
+LOCK="$HOME/.sync.lock"
+LOG="$LOGS_PATH/$PAK_NAME-service.txt"
+REPORT_FILE="$SDCARD_PATH/$PAK_NAME - REPORT.txt"
+
+log() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"
+}
+
+ui_enabled() {
+    [ "${DELTASYNC_WORKER_UI:-0}" = "1" ] && [ -x "$PRESENTER" ]
+}
+
+ui_stop() {
+    [ -n "${UI_PID:-}" ] || return 0
+    pid="$UI_PID"
+    UI_PID=""
+
+    # minui-presenter normally exits immediately on TERM, but field logs caught
+    # it stuck during SDL teardown: Dropbox had finished, yet this wait never
+    # returned, so NextUI remained on the sync screen and the lock survived the
+    # reboot. Keep the normal fast path, with a PID-specific watchdog as the
+    # hard upper bound. Never use killall: another Pak may own another window.
+    if kill "$pid" 2>/dev/null; then
+        (
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null || true
+        ) &
+        watchdog=$!
+        wait "$pid" 2>/dev/null || true
+        kill "$watchdog" 2>/dev/null || true
+        wait "$watchdog" 2>/dev/null || true
+    else
+        wait "$pid" 2>/dev/null || true
+    fi
+}
+
+ui_start() {
+    ui_enabled || return 0
+    ui_stop
+    "$PRESENTER" --message "$1" --timeout -1 >/dev/null 2>&1 &
+    UI_PID=$!
+}
+
+ui_show() {
+    ui_enabled || return 0
+    ui_stop
+    "$PRESENTER" --message "$1" --timeout "${2:-2}" >/dev/null 2>&1 || true
+}
+
+boot_id() {
+    cat /proc/sys/kernel/random/boot_id 2>/dev/null || true
+}
+
+lock_owner_is_live() {
+    owner="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    case "$owner" in ''|*[!0-9]*) return 1 ;; esac
+
+    current_boot="$(boot_id)"
+    owner_boot="$(cat "$LOCK/boot-id" 2>/dev/null || true)"
+    if [ -n "$current_boot" ] && [ -n "$owner_boot" ] \
+            && [ "$current_boot" != "$owner_boot" ]; then
+        return 1
+    fi
+    kill -0 "$owner" 2>/dev/null
+}
+
+acquire_lock() {
+    if mkdir "$LOCK" 2>/dev/null; then
+        echo "$$" >"$LOCK/pid"
+        boot_id >"$LOCK/boot-id"
+        return 0
+    fi
+
+    if lock_owner_is_live; then
+        log "skipping $reason sync, another sync is running (pid $(cat "$LOCK/pid"))"
+        echo "Another sync is already running. Please try again in a moment."
+        return 1
+    fi
+
+    # Allow an acquiring process time to write its owner file before deciding
+    # that an ownerless directory is the remnant of an interrupted sync.
+    sleep 1
+    if lock_owner_is_live; then
+        log "skipping $reason sync, another sync is running (pid $(cat "$LOCK/pid"))"
+        echo "Another sync is already running. Please try again in a moment."
+        return 1
+    fi
+
+    rm -f "$LOCK/pid" "$LOCK/boot-id" 2>/dev/null
+    if ! rmdir "$LOCK" 2>/dev/null; then
+        log "skipping $reason sync, lock contains unexpected data"
+        echo "Sync could not start because its lock could not be recovered."
+        return 1
+    fi
+    log "recovered stale sync lock ($reason)"
+
+    mkdir "$LOCK" 2>/dev/null || return 1
+    echo "$$" >"$LOCK/pid"
+    boot_id >"$LOCK/boot-id"
+}
+
+release_lock() {
+    [ "$(cat "$LOCK/pid" 2>/dev/null || true)" = "$$" ] || return 0
+    rm -f "$LOCK/pid" "$LOCK/boot-id" 2>/dev/null
+    rmdir "$LOCK" 2>/dev/null || true
+}
+
+cleanup() {
+    ui_stop
+    release_lock
+}
+
+acquire_lock || exit 75
+trap 'cleanup' EXIT INT TERM HUP
+
+log "sync started ($reason${rom_path:+: $rom_path})"
+OUT="$HOME/.sync-output.$$"
+if [ "$reason" = "after-game" ] && [ -n "$rom_path" ]; then
+    local_status="$("$DELTASYNC" local-changes --rom "$rom_path" 2>>"$LOG" || echo unknown)"
+    if [ "$local_status" = "unchanged" ]; then
+        log "sync skipped (after-game: no local changes)"
+        release_lock
+        trap - EXIT INT TERM HUP
+        exit 0
+    fi
+fi
+case "$reason" in
+    pre-game|after-game)
+        ui_start "Syncing with Delta Sync..."
+        ;;
+esac
+
+case "$reason" in
+    pre-game|after-game)
+        if [ -n "$rom_path" ]; then
+            "$DELTASYNC" sync --rom "$rom_path" >"$OUT" 2>&1
+        else
+            "$DELTASYNC" sync >"$OUT" 2>&1
+        fi
+        ;;
+    *)
+        "$DELTASYNC" sync >"$OUT" 2>&1
+        ;;
+esac
+sync_rc=$?
+ui_stop
+cat "$OUT"
+cat "$OUT" >>"$LOG"
+
+if [ "$sync_rc" -eq 0 ]; then
+    log "sync finished ($reason)"
+    verdict="Auto Sync ($reason)"
+else
+    log "sync failed ($reason, exit $sync_rc)"
+    verdict="Auto Sync ($reason) FAILED"
+fi
+
+if [ "$reason" = "after-game" ] && [ -n "$rom_path" ]; then
+    verdict="After game ($(basename "$rom_path"))"
+    [ "$sync_rc" -eq 0 ] || verdict="$verdict FAILED"
+fi
+
+if [ "$sync_rc" -ne 0 ]; then
+    case "$reason" in
+        pre-game) ui_show "Delta check failed.
+Starting with the handheld save." 3 ;;
+        after-game) ui_show "Delta upload failed.
+Open Delta Sync to retry." 3 ;;
+    esac
+fi
+
+if [ "${DELTASYNC_WORKER_REPORT:-1}" != "0" ]; then
+    {
+        echo "==== $verdict == $(date '+%Y-%m-%d %H:%M:%S') ===="
+        cat "$OUT"
+        echo ""
+        cat "$REPORT_FILE" 2>/dev/null
+    } | head -n 3000 >"$REPORT_FILE.tmp" \
+        && mv -f "$REPORT_FILE.tmp" "$REPORT_FILE"
+    sync
+fi
+
+rm -f "$OUT"
+release_lock
+trap - EXIT INT TERM HUP
+exit "$sync_rc"

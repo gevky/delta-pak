@@ -1,0 +1,21 @@
+#!/bin/sh
+# Stub: records arguments, and -- crucially -- whether a --background-image
+# actually exists at the moment it would be drawn. Checking after the script
+# exits is too late, because cleanup deletes the temp file.
+# Flatten newlines: a message argument spans lines, and logging it raw split
+# one call across several log lines, so a check for two flags on the same call
+# silently matched nothing.
+echo "minui-presenter $*" | tr '\n' ' ' >>"$STUB_LOG"
+echo "" >>"$STUB_LOG"
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--background-image" ]; then
+    if [ -f "$a" ]; then
+      echo "BACKGROUND_IMAGE_PRESENT $a" >>"$STUB_LOG"
+    else
+      echo "BACKGROUND_IMAGE_MISSING $a" >>"$STUB_LOG"
+    fi
+  fi
+  prev="$a"
+done
+exit 0

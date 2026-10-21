@@ -1,0 +1,23 @@
+dist/
+/deltasync
+.DS_Store
+# Local planning notes stay outside the public source snapshot.
+/docs/plans/
+/docs/superpowers/
+# Linked-account data and local sync reports must stay private.
+config.json
+pending-auth.json
+sync-state.json
+Delta Sync - *.txt
+# Built and downloaded binaries: everything under bin/ except the shell
+# helpers that are part of the source tree.
+pak/Delta Sync.pak/bin/*
+!pak/Delta Sync.pak/bin/shared/
+pak/Delta Sync.pak/bin/shared/*
+# Shell helpers are source, not build output. Whitelisting them one file at a
+# time silently dropped a new one from the repo -- the Pak built fine locally
+# and CI failed on a file that only existed on this machine.
+!pak/Delta Sync.pak/bin/shared/*.sh
+!pak/Delta Sync.pak/bin/shared/watch-and-sync
+!pak/Delta Sync.pak/bin/shared/sync-worker
+pak/Delta Sync.pak/dropbox_app_key.txt

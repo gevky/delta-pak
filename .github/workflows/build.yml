@@ -1,0 +1,97 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - name: Test
+        run: make test
+
+      # Set the repository secret DROPBOX_APP_KEY (once, by the repo owner) and
+      # every build becomes login-and-go: users never visit the Dropbox
+      # developer console. Without the secret, builds still work but each user
+      # supplies their own app key.
+      - name: Build the Pak and desktop binaries
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+        run: |
+          make package
+          make desktop
+
+      # The menu helpers are published per DEVICE, not per architecture:
+      # the assets are named minui-list-tg5040-nextui and so on. An earlier
+      # version of this step grepped for "arm64", matched nothing, and -- being
+      # continue-on-error -- shipped a Pak with no menus that exited instantly
+      # on the device. So this step now fails the build if the helpers for the
+      # primary platform are missing, and verifies each download is a real
+      # ELF binary rather than an error page.
+      - name: Bundle the on-screen menu helpers
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # NextUI-specific builds where they exist; tg5040 covers the TrimUI
+          # Brick and Smart Pro, which is the platform this Pak targets.
+          for platform in tg5040-nextui tg5050-nextui h700-nextui my355-nextui rgb30 rg35xxplus miyoomini; do
+            dest="pak/Delta Sync.pak/bin/${platform%-nextui}"
+            mkdir -p "$dest"
+            for name in minui-list minui-presenter minui-keyboard; do
+              url=$(gh release view --repo "josegonzalez/$name" --json assets \
+                    --jq ".assets[] | select(.name==\"$name-$platform\") | .url") || url=""
+              if [ -z "$url" ]; then
+                echo "::warning::no $name asset for $platform"
+                continue
+              fi
+              curl -sSL -o "$dest/$name" "$url"
+              # An HTML error page would be silently useless at runtime.
+              file "$dest/$name" | grep -q ELF || {
+                echo "::error::$name for $platform is not a binary"; exit 1; }
+              chmod +x "$dest/$name"
+            done
+          done
+          echo "Bundled helpers:"
+          find "pak/Delta Sync.pak/bin" -type f -name 'minui-*' -exec ls -l {} +
+          # The Pak is unusable on its primary target without these.
+          for name in minui-list minui-presenter minui-keyboard; do
+            test -x "pak/Delta Sync.pak/bin/tg5040/$name" || {
+              echo "::error::missing $name for tg5040"; exit 1; }
+          done
+
+      - name: Repackage with any helpers that were fetched
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+        run: make package
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: delta-sync-pak
+          path: |
+            dist/*.zip
+            dist/deltasync-*
+          if-no-files-found: error
+
+      - name: Publish a release for tags
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/deltasync-*
+          generate_release_notes: true
